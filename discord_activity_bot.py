@@ -49,7 +49,7 @@ RANKS = [
     (10000, "Huyền Thoại"),
 ]
 
-DB_PATH = "activity_bot.db"
+DB_PATH = os.getenv("DB_PATH", "activity_bot.db")
 
 if not TOKEN:
     raise RuntimeError("Thiếu DISCORD_TOKEN trong file .env")
@@ -64,7 +64,14 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # =========================
 # DATABASE
 # =========================
+def ensure_db_dir():
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+
 def get_conn():
+    ensure_db_dir()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
