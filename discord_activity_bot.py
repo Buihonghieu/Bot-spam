@@ -37,7 +37,16 @@ ADMIN_IMAGE_POINTS = 20
 MESSAGE_COOLDOWN_SECONDS = 30  # chống spam farm
 MIN_TEXT_LENGTH = 3            # quá ngắn sẽ không tính
 POINTS_PER_TICKET = 1000       # 1000 điểm = 1 vé
-SPAM_WARN_COOLDOWN_SECONDS = 120  # mỗi người chỉ bị cảnh báo 1 lần trong khoảng này để tránh bot spam cảnh báo
+
+# Từ nhạy cảm / từ cấm
+# Khuyên dùng trong .env, ví dụ:
+# SENSITIVE_WORDS=dm,đm,cc,cl,vcl,ngu,óc chó,cút,mẹ mày
+SENSITIVE_WORDS = {
+    x.strip().lower()
+    for x in os.getenv("SENSITIVE_WORDS", "").split(",")
+    if x.strip()
+}
+SENSITIVE_WORD_PENALTY = max(0, int(os.getenv("SENSITIVE_WORD_PENALTY", "20")))
 
 # Rank
 RANKS = [
@@ -159,11 +168,11 @@ def add_points(
     cur.execute(
         """
         UPDATE users
-        SET points = points + ?,
-            chat_points = chat_points + ?,
-            image_points = image_points + ?,
-            total_messages = total_messages + ?,
-            total_images = total_images + ?,
+        SET points = MAX(0, points + ?),
+            chat_points = MAX(0, chat_points + ?),
+            image_points = MAX(0, image_points + ?),
+            total_messages = MAX(0, total_messages + ?),
+            total_images = MAX(0, total_images + ?),
             username = ?,
             updated_at = ?
         WHERE guild_id = ? AND user_id = ?
@@ -325,6 +334,22 @@ def has_image_attachment(message: discord.Message) -> bool:
     return False
 
 
+def normalize_text(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def find_sensitive_words(text: str) -> list[str]:
+    if not text or not SENSITIVE_WORDS:
+        return []
+
+    normalized = normalize_text(text)
+    found = []
+    for bad_word in SENSITIVE_WORDS:
+        if bad_word in normalized:
+            found.append(bad_word)
+    return sorted(set(found))
+
+
 def build_stats_embed(member: discord.Member, row: sqlite3.Row) -> discord.Embed:
     points = int(row["points"])
     tickets = calc_tickets(points)
@@ -436,11 +461,12 @@ async def on_message(message: discord.Message):
     ensure_user(guild_id, user_id, username)
 
     # Anti spam theo cooldown
-    last_ts, last_warn_ts = get_cooldown_data(guild_id, user_id)
+    last_ts, _ = get_cooldown_data(guild_id, user_id)
     in_cooldown = (now_ts - last_ts) < MESSAGE_COOLDOWN_SECONDS
 
     image_in_admin_room = message.channel.id in ADMIN_IMAGE_CHANNEL_IDS and has_image_attachment(message)
     valid_text = is_valid_text_message(message)
+    sensitive_matches = find_sensitive_words(message.content or "")
 
     gained_points = 0
     chat_points = 0
@@ -459,18 +485,11 @@ async def on_message(message: discord.Message):
         image_points += ADMIN_IMAGE_POINTS
         total_images += 1
 
-    if in_cooldown and valid_text:
-        if (now_ts - last_warn_ts) >= SPAM_WARN_COOLDOWN_SECONDS:
-            try:
-                await message.channel.send(
-                    f"⚠️ {message.author.mention} đừng spam quá nhanh nhé. Tin nhắn vẫn gửi được nhưng sẽ không được tính điểm nếu chưa qua cooldown {MESSAGE_COOLDOWN_SECONDS} giây.",
-                    delete_after=8,
-                )
-            except Exception:
-                pass
-            set_cooldown_data(guild_id, user_id, warn_ts=now_ts)
+    if sensitive_matches:
+        penalty_points = SENSITIVE_WORD_PENALTY * len(sensitive_matches)
+        gained_points -= penalty_points
 
-    if gained_points > 0:
+    if gained_points != 0 or total_messages > 0 or total_images > 0:
         add_points(
             guild_id,
             user_id,
@@ -544,7 +563,8 @@ async def rank(interaction: discord.Interaction):
     lines.append(f"\nQuy đổi vé: **{POINTS_PER_TICKET:,} điểm = 1 vé quay random**")
     lines.append(f"Điểm chat: **+{CHAT_POINTS}** | Ảnh trong room admin: **+{ADMIN_IMAGE_POINTS}**")
     lines.append(f"Cooldown chat chống spam: **{MESSAGE_COOLDOWN_SECONDS}s**")
-    lines.append(f"Nếu nhắn quá nhanh, bot sẽ cảnh báo và tin nhắn đó không được tính điểm.")
+    if SENSITIVE_WORDS and SENSITIVE_WORD_PENALTY > 0:
+        lines.append(f"Tin nhắn chứa từ nhạy cảm sẽ bị trừ: **-{SENSITIVE_WORD_PENALTY} điểm / từ khóa khớp**")
 
     embed = discord.Embed(
         title="Hệ thống rank & vé quay",
