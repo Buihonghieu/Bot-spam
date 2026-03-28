@@ -39,9 +39,9 @@ MIN_TEXT_LENGTH = 3            # quá ngắn sẽ không tính
 POINTS_PER_TICKET = 1000       # 1000 điểm = 1 vé
 
 # Từ nhạy cảm / từ cấm
-# Khuyên dùng trong .env, ví dụ:
+# Có thể khai báo sẵn trong .env để nạp lần đầu khi bot khởi động:
 # SENSITIVE_WORDS=dm,đm,cc,cl,vcl,ngu,óc chó,cút,mẹ mày
-SENSITIVE_WORDS = {
+DEFAULT_SENSITIVE_WORDS = {
     x.strip().lower()
     for x in os.getenv("SENSITIVE_WORDS", "").split(",")
     if x.strip()
@@ -126,6 +126,17 @@ def init_db():
             key TEXT NOT NULL,
             value TEXT NOT NULL,
             PRIMARY KEY (guild_id, key)
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sensitive_words (
+            guild_id INTEGER NOT NULL,
+            word TEXT NOT NULL,
+            created_at TEXT,
+            PRIMARY KEY (guild_id, word)
         )
         """
     )
@@ -279,6 +290,102 @@ def set_cooldown_data(guild_id: int, user_id: int, *, message_ts: Optional[int] 
     conn.close()
 
 
+def seed_default_sensitive_words():
+    if not DEFAULT_SENSITIVE_WORDS:
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT guild_id FROM users")
+    guild_rows = cur.fetchall()
+
+    for row in guild_rows:
+        guild_id = int(row["guild_id"])
+        for word in DEFAULT_SENSITIVE_WORDS:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO sensitive_words (guild_id, word, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (guild_id, word, utc_now_iso()),
+            )
+
+    conn.commit()
+    conn.close()
+
+
+def ensure_guild_sensitive_words_seeded(guild_id: int):
+    if not DEFAULT_SENSITIVE_WORDS:
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    for word in DEFAULT_SENSITIVE_WORDS:
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO sensitive_words (guild_id, word, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (guild_id, word, utc_now_iso()),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_sensitive_words(guild_id: int) -> list[str]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT word
+        FROM sensitive_words
+        WHERE guild_id = ?
+        ORDER BY word COLLATE NOCASE ASC
+        """,
+        (guild_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [str(row["word"]) for row in rows]
+
+
+def add_sensitive_word(guild_id: int, word: str) -> bool:
+    normalized = normalize_text(word)
+    if not normalized:
+        return False
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO sensitive_words (guild_id, word, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (guild_id, normalized, utc_now_iso()),
+    )
+    changed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def remove_sensitive_word(guild_id: int, word: str) -> bool:
+    normalized = normalize_text(word)
+    if not normalized:
+        return False
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM sensitive_words WHERE guild_id = ? AND word = ?",
+        (guild_id, normalized),
+    )
+    changed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
 # =========================
 # HÀM HỖ TRỢ
 # =========================
@@ -338,13 +445,14 @@ def normalize_text(text: str) -> str:
     return " ".join((text or "").lower().split())
 
 
-def find_sensitive_words(text: str) -> list[str]:
-    if not text or not SENSITIVE_WORDS:
+def find_sensitive_words(guild_id: int, text: str) -> list[str]:
+    words = get_sensitive_words(guild_id)
+    if not text or not words:
         return []
 
     normalized = normalize_text(text)
     found = []
-    for bad_word in SENSITIVE_WORDS:
+    for bad_word in words:
         if bad_word in normalized:
             found.append(bad_word)
     return sorted(set(found))
@@ -436,6 +544,7 @@ def export_summary_text(guild_id: int) -> str:
 @bot.event
 async def on_ready():
     init_db()
+    seed_default_sensitive_words()
     try:
         synced = await bot.tree.sync()
         print(f"Đã sync {len(synced)} slash commands")
@@ -459,6 +568,7 @@ async def on_message(message: discord.Message):
 
     # Luôn đảm bảo user tồn tại trong DB
     ensure_user(guild_id, user_id, username)
+    ensure_guild_sensitive_words_seeded(guild_id)
 
     # Anti spam theo cooldown
     last_ts, _ = get_cooldown_data(guild_id, user_id)
@@ -466,7 +576,7 @@ async def on_message(message: discord.Message):
 
     image_in_admin_room = message.channel.id in ADMIN_IMAGE_CHANNEL_IDS and has_image_attachment(message)
     valid_text = is_valid_text_message(message)
-    sensitive_matches = find_sensitive_words(message.content or "")
+    sensitive_matches = find_sensitive_words(guild_id, message.content or "")
 
     gained_points = 0
     chat_points = 0
@@ -563,7 +673,9 @@ async def rank(interaction: discord.Interaction):
     lines.append(f"\nQuy đổi vé: **{POINTS_PER_TICKET:,} điểm = 1 vé quay random**")
     lines.append(f"Điểm chat: **+{CHAT_POINTS}** | Ảnh trong room admin: **+{ADMIN_IMAGE_POINTS}**")
     lines.append(f"Cooldown chat chống spam: **{MESSAGE_COOLDOWN_SECONDS}s**")
-    if SENSITIVE_WORDS and SENSITIVE_WORD_PENALTY > 0:
+    if interaction.guild and SENSITIVE_WORD_PENALTY > 0:
+        word_count = len(get_sensitive_words(interaction.guild.id))
+        lines.append(f"Từ nhạy cảm đang bật: **{word_count}** từ")
         lines.append(f"Tin nhắn chứa từ nhạy cảm sẽ bị trừ: **-{SENSITIVE_WORD_PENALTY} điểm / từ khóa khớp**")
 
     embed = discord.Embed(
@@ -661,6 +773,88 @@ async def trudiem(interaction: discord.Interaction, member: discord.Member, poin
         f"Tổng vé hiện tại: **{tickets}**"
     )
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="themtucam", description="Admin thêm một từ nhạy cảm để bot tự trừ điểm")
+@app_commands.describe(word="Từ hoặc cụm từ muốn thêm")
+async def themtucam(interaction: discord.Interaction, word: str):
+    if not interaction.guild:
+        return await interaction.response.send_message("Lệnh này chỉ dùng trong server.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not has_admin_role(interaction.user):
+        return await interaction.response.send_message("Bạn không có quyền dùng lệnh này.", ephemeral=True)
+
+    normalized = normalize_text(word)
+    if not normalized:
+        return await interaction.response.send_message("Từ nhạy cảm không hợp lệ.", ephemeral=True)
+
+    created = add_sensitive_word(interaction.guild.id, normalized)
+    all_words = get_sensitive_words(interaction.guild.id)
+
+    if created:
+        await interaction.response.send_message(
+            f"Đã thêm từ nhạy cảm: **{normalized}**\nTổng số từ đang có: **{len(all_words)}**",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            f"Từ **{normalized}** đã tồn tại sẵn rồi.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="xoatucam", description="Admin xóa một từ nhạy cảm khỏi danh sách trừ điểm")
+@app_commands.describe(word="Từ hoặc cụm từ muốn xóa")
+async def xoatucam(interaction: discord.Interaction, word: str):
+    if not interaction.guild:
+        return await interaction.response.send_message("Lệnh này chỉ dùng trong server.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not has_admin_role(interaction.user):
+        return await interaction.response.send_message("Bạn không có quyền dùng lệnh này.", ephemeral=True)
+
+    normalized = normalize_text(word)
+    if not normalized:
+        return await interaction.response.send_message("Từ nhạy cảm không hợp lệ.", ephemeral=True)
+
+    removed = remove_sensitive_word(interaction.guild.id, normalized)
+    all_words = get_sensitive_words(interaction.guild.id)
+
+    if removed:
+        await interaction.response.send_message(
+            f"Đã xóa từ nhạy cảm: **{normalized}**\nCòn lại: **{len(all_words)}** từ",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            f"Không tìm thấy từ **{normalized}** trong danh sách.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="dstucam", description="Xem danh sách từ nhạy cảm đang dùng để trừ điểm")
+async def dstucam(interaction: discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message("Lệnh này chỉ dùng trong server.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not has_admin_role(interaction.user):
+        return await interaction.response.send_message("Bạn không có quyền dùng lệnh này.", ephemeral=True)
+
+    words = get_sensitive_words(interaction.guild.id)
+    if not words:
+        return await interaction.response.send_message("Hiện chưa có từ nhạy cảm nào.", ephemeral=True)
+
+    preview = "\n".join(f"- {word}" for word in words[:100])
+    more = ""
+    if len(words) > 100:
+        more = f"\n... và {len(words) - 100} từ khác"
+
+    embed = discord.Embed(
+        title="Danh sách từ nhạy cảm",
+        description=(
+            f"Số lượng: **{len(words)}**\n"
+            f"Mức trừ hiện tại: **-{SENSITIVE_WORD_PENALTY} điểm / từ khóa khớp**\n\n"
+            f"{preview}{more}"
+        ),
+        color=discord.Color.orange(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="xuatwheel", description="Xuất file tên lặp theo số vé để dán vào vòng quay random")
