@@ -34,9 +34,10 @@ ADMIN_ROLE_IDS = {
 # Điểm
 CHAT_POINTS = 5
 ADMIN_IMAGE_POINTS = 20
-MESSAGE_COOLDOWN_SECONDS = 30  # chống spam farm
+MESSAGE_COOLDOWN_SECONDS = 30  # chống spam farm; tin trong cooldown bị bỏ qua âm thầm
 MIN_TEXT_LENGTH = 3            # quá ngắn sẽ không tính
 POINTS_PER_TICKET = 1000       # 1000 điểm = 1 vé
+LEADERBOARD_PAGE_SIZE = 15     # số người hiển thị trên mỗi trang BXH
 
 # Từ nhạy cảm / từ cấm
 # Có thể khai báo sẵn trong .env để nạp lần đầu khi bot khởi động:
@@ -216,17 +217,17 @@ def get_user_stats(guild_id: int, user_id: int) -> Optional[sqlite3.Row]:
     return row
 
 
-def get_top_users(guild_id: int, limit: int = 10):
+def get_top_users(guild_id: int):
+    """Lấy toàn bộ người đã tham gia hệ thống điểm của server."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
         SELECT * FROM users
         WHERE guild_id = ?
-        ORDER BY points DESC, total_messages DESC, total_images DESC
-        LIMIT ?
+        ORDER BY points DESC, total_messages DESC, total_images DESC, username COLLATE NOCASE ASC
         """,
-        (guild_id, limit),
+        (guild_id,),
     )
     rows = cur.fetchall()
     conn.close()
@@ -490,6 +491,94 @@ def build_stats_embed(member: discord.Member, row: sqlite3.Row) -> discord.Embed
     return embed
 
 
+def build_leaderboard_embed(rows: list[sqlite3.Row], page: int, page_size: int) -> discord.Embed:
+    total_users = len(rows)
+    total_pages = max(1, (total_users + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    page_rows = rows[start:start + page_size]
+
+    lines = []
+    for idx, row in enumerate(page_rows, start=start + 1):
+        points = int(row["points"])
+        tickets = calc_tickets(points)
+        rank_name = get_rank_name(points)
+        username = discord.utils.escape_markdown(str(row["username"]))
+        lines.append(
+            f"**{idx}. {username}** — {points:,} điểm | {tickets} vé | {rank_name}"
+        )
+
+    embed = discord.Embed(
+        title="BXH tương tác - Toàn bộ người tham gia",
+        description="\n".join(lines) if lines else "Chưa có dữ liệu BXH.",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=f"Trang {page + 1}/{total_pages} • Tổng cộng {total_users} người")
+    return embed
+
+
+class LeaderboardView(discord.ui.View):
+    def __init__(self, rows: list[sqlite3.Row], page_size: int = LEADERBOARD_PAGE_SIZE):
+        super().__init__(timeout=300)
+        self.rows = rows
+        self.page_size = page_size
+        self.page = 0
+        self.total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+        self.message: Optional[discord.Message] = None
+
+        self.previous_button = discord.ui.Button(
+            label="◀ Trang trước",
+            style=discord.ButtonStyle.secondary,
+        )
+        self.page_button = discord.ui.Button(
+            label="Trang 1/1",
+            style=discord.ButtonStyle.secondary,
+            disabled=True,
+        )
+        self.next_button = discord.ui.Button(
+            label="Trang sau ▶",
+            style=discord.ButtonStyle.secondary,
+        )
+
+        self.previous_button.callback = self.go_previous
+        self.next_button.callback = self.go_next
+
+        self.add_item(self.previous_button)
+        self.add_item(self.page_button)
+        self.add_item(self.next_button)
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.previous_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= self.total_pages - 1
+        self.page_button.label = f"Trang {self.page + 1}/{self.total_pages}"
+
+    def build_embed(self) -> discord.Embed:
+        return build_leaderboard_embed(self.rows, self.page, self.page_size)
+
+    async def go_previous(self, interaction: discord.Interaction):
+        if self.page > 0:
+            self.page -= 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def go_next(self, interaction: discord.Interaction):
+        if self.page < self.total_pages - 1:
+            self.page += 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
 def export_wheel_text(guild_id: int) -> str:
     conn = get_conn()
     cur = conn.cursor()
@@ -570,7 +659,8 @@ async def on_message(message: discord.Message):
     ensure_user(guild_id, user_id, username)
     ensure_guild_sensitive_words_seeded(guild_id)
 
-    # Anti spam theo cooldown
+    # Anti-spam chạy âm thầm: tin nhắn trong cooldown chỉ không được cộng điểm.
+    # Bot không reply, mention hoặc gửi thông báo cảnh báo spam.
     last_ts, _ = get_cooldown_data(guild_id, user_id)
     in_cooldown = (now_ts - last_ts) < MESSAGE_COOLDOWN_SECONDS
 
@@ -636,35 +726,18 @@ async def diem(interaction: discord.Interaction, member: Optional[discord.Member
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="top", description="Xem BXH tương tác của server")
-@app_commands.describe(limit="Số người muốn hiển thị, tối đa 20")
-async def top(interaction: discord.Interaction, limit: Optional[int] = 10):
+@bot.tree.command(name="top", description="Xem BXH của toàn bộ người tham gia bot spam")
+async def top(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("Lệnh này chỉ dùng trong server.", ephemeral=True)
 
-    limit = max(1, min(limit or 10, 20))
-    rows = get_top_users(interaction.guild.id, limit)
-
+    rows = get_top_users(interaction.guild.id)
     if not rows:
         return await interaction.response.send_message("Chưa có dữ liệu BXH.", ephemeral=True)
 
-    embed = discord.Embed(
-        title=f"BXH tương tác - Top {limit}",
-        color=discord.Color.gold(),
-        timestamp=datetime.now(timezone.utc),
-    )
-
-    lines = []
-    for idx, row in enumerate(rows, start=1):
-        points = int(row["points"])
-        tickets = calc_tickets(points)
-        rank_name = get_rank_name(points)
-        lines.append(
-            f"**{idx}. {row['username']}** — {points:,} điểm | {tickets} vé | {rank_name}"
-        )
-
-    embed.description = "\n".join(lines)
-    await interaction.response.send_message(embed=embed)
+    view = LeaderboardView(rows)
+    await interaction.response.send_message(embed=view.build_embed(), view=view)
+    view.message = await interaction.original_response()
 
 
 @bot.tree.command(name="rank", description="Xem các mốc rank của server")
@@ -672,7 +745,10 @@ async def rank(interaction: discord.Interaction):
     lines = [f"**{name}**: từ **{points:,}** điểm" for points, name in RANKS]
     lines.append(f"\nQuy đổi vé: **{POINTS_PER_TICKET:,} điểm = 1 vé quay random**")
     lines.append(f"Điểm chat: **+{CHAT_POINTS}** | Ảnh trong room admin: **+{ADMIN_IMAGE_POINTS}**")
-    lines.append(f"Cooldown chat chống spam: **{MESSAGE_COOLDOWN_SECONDS}s**")
+    lines.append(
+        f"Cooldown chat chống spam: **{MESSAGE_COOLDOWN_SECONDS}s** "
+        "(bot bỏ qua âm thầm, không gửi thông báo)"
+    )
     if interaction.guild and SENSITIVE_WORD_PENALTY > 0:
         word_count = len(get_sensitive_words(interaction.guild.id))
         lines.append(f"Từ nhạy cảm đang bật: **{word_count}** từ")
